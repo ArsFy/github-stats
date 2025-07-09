@@ -295,6 +295,38 @@ Project page views: {await self.views:,}
 Languages:
   - {formatted_languages}"""
 
+    async def get_orgs(self) -> List[str]:
+        """
+        Get all org names that the current token user belongs to (including private orgs)
+        """
+        orgs = []
+        page = 1
+        while True:
+            result = await self.queries.query_rest("/user/orgs", params={"per_page": 100, "page": page})
+            if not result:
+                break
+            orgs += [org["login"] for org in result]
+            if len(result) < 100:
+                break
+            page += 1
+        return orgs
+
+    async def get_org_repos(self, org: str) -> List[dict]:
+        """
+        Get all repo info for the specified org
+        """
+        repos = []
+        page = 1
+        while True:
+            result = await self.queries.query_rest(f"/orgs/{org}/repos", params={"per_page": 100, "page": page, "type": "all"})
+            if not result:
+                break
+            repos += result
+            if len(result) < 100:
+                break
+            page += 1
+        return repos
+
     async def get_stats(self) -> None:
         """
         Get lots of summary statistics using one big query. Sets many attributes
@@ -334,9 +366,7 @@ Languages:
             )
 
             repos = owned_repos.get("nodes", [])
-            if not self._ignore_forked_repos:
-                repos += contrib_repos.get("nodes", [])
-
+            # Only count stars and forks for repos owned by the user
             for repo in repos:
                 if repo is None:
                     continue
@@ -362,6 +392,7 @@ Languages:
                             "color": lang.get("node", {}).get("color"),
                         }
 
+            # Do not count stars and forks for contrib_repos
             if owned_repos.get("pageInfo", {}).get(
                 "hasNextPage", False
             ) or contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
@@ -374,11 +405,42 @@ Languages:
             else:
                 break
 
-        # TODO: Improve languages to scale by number of contributions to
-        #       specific filetypes
+        # org repo only counts towards repo and language, not star or fork
+        orgs = await self.get_orgs()
+        print("ORG", orgs)
+        for org in orgs:
+            org_repos = await self.get_org_repos(org)
+            for repo in org_repos:
+                full_name = repo.get("full_name")
+                if not full_name or full_name in self._repos or full_name in self._exclude_repos:
+                    continue
+                if self._ignore_forked_repos and repo.get("fork"):
+                    continue
+                self._repos.add(full_name)
+                # Do not count org repo's star and fork
+                # self._stargazers += repo.get("stargazers_count", 0)
+                # self._forks += repo.get("forks_count", 0)
+                # Language statistics
+                lang_url = repo.get("languages_url")
+                if lang_url:
+                    langs = await self.queries.query_rest(lang_url.replace("https://api.github.com/", ""))
+                    for lang_name, size in langs.items():
+                        if lang_name.lower() in exclude_langs_lower:
+                            continue
+                        languages = await self.languages
+                        if lang_name in languages:
+                            languages[lang_name]["size"] += size
+                            languages[lang_name]["occurrences"] += 1
+                        else:
+                            languages[lang_name] = {
+                                "size": size,
+                                "occurrences": 1,
+                                "color": None,
+                            }
+
         langs_total = sum([v.get("size", 0) for v in self._languages.values()])
         for k, v in self._languages.items():
-            v["prop"] = 100 * (v.get("size", 0) / langs_total)
+            v["prop"] = 100 * (v.get("size", 0) / langs_total) if langs_total else 0
 
     @property
     async def name(self) -> str:
@@ -484,21 +546,53 @@ Languages:
         additions = 0
         deletions = 0
         for repo in await self.repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
-            for author_obj in r:
-                # Handle malformed response from the API by skipping this repo
-                if not isinstance(author_obj, dict) or not isinstance(
-                    author_obj.get("author", {}), dict
-                ):
-                    continue
-                author = author_obj.get("author", {}).get("login", "")
-                if author != self.username:
-                    continue
-
-                for week in author_obj.get("weeks", []):
-                    additions += week.get("a", 0)
-                    deletions += week.get("d", 0)
-
+            retry = 0
+            repo_add = 0
+            repo_del = 0
+            while retry < 5:
+                r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
+                if isinstance(r, dict):
+                    if r.get("message") == "Not Found":
+                        print(f"[WARN] Repo not found or no access: {repo}")
+                        break
+                    elif r.get("message") == "Must have push access to view repository contributors.":
+                        print(f"[WARN] No push access for: {repo}")
+                        break
+                    elif r == {} or r.get("message", "").startswith("Git Repository is empty"):
+                        print(f"[WARN] Empty or no stats for: {repo}")
+                        break
+                    else:
+                        await asyncio.sleep(2)
+                        retry += 1
+                        continue
+                elif isinstance(r, list):
+                    found = False
+                    for author_obj in r:
+                        if not isinstance(author_obj, dict) or not isinstance(
+                            author_obj.get("author", {}), dict
+                        ):
+                            continue
+                        author = author_obj.get("author", {}).get("login", "")
+                        print(f"[LOG] Processing author: {author} for repo: {repo}")
+                        print(f"[LOG] MY: {self.username}")
+                        if author != self.username:
+                            continue
+                        found = True
+                        for week in author_obj.get("weeks", []):
+                            print(f"[LOG] Processing week: {week} for user: {author} in repo: {repo}")
+                            repo_add += week.get("a", 0)
+                            repo_del += week.get("d", 0)
+                        print(f"[LOG] Found contributions for user: {author} in repo: {repo}")
+                        print(f"[LOG] Additions: {repo_add} | Deletions: {repo_del}")
+                    if not found:
+                        print(f"[INFO] No contributions found for user in repo: {repo}")
+                    break
+                else:
+                    print(f"[WARN] Unexpected response for repo: {repo}")
+                    break
+            additions += repo_add
+            deletions += repo_del
+            print(f"[LOG] Repo: {repo} | additions: {repo_add} | deletions: {repo_del}")
         self._lines_changed = (additions, deletions)
         return self._lines_changed
 
